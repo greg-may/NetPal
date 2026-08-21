@@ -9,7 +9,7 @@ from PyQt6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout,
                              QTableWidget, QTableWidgetItem, QHeaderView, 
                              QMessageBox, QFileDialog, QProgressBar, QFrame,
                              QDialog, QListWidget, QListWidgetItem, QDialogButtonBox)
-from PyQt6.QtCore import QThread, pyqtSignal
+from PyQt6.QtCore import QThread, pyqtSignal, Qt
 
 ULS_DB = "uls_cache.db"
 LOG_DB = "net_logs.db"
@@ -42,7 +42,6 @@ def init_databases():
         )
     ''')
     
-    # Check if 'net_id' column exists in existing 'checkins' table, add if missing
     c.execute("PRAGMA table_info(checkins)")
     columns = [col[1] for col in c.fetchall()]
     if 'net_id' not in columns:
@@ -93,12 +92,11 @@ def update_uls_db(status_callback=None):
         for row in reader:
             if len(row) > 17 and row[0] == 'EN':
                 call = row[4].strip()
-                city = row[16].strip()   # City (Column 17, 0-indexed 16)
-                state = row[17].strip()  # State (Column 18, 0-indexed 17)
+                city = row[16].strip()
+                state = row[17].strip()
                 if call:
                     to_db.append((call, row[8].strip(), row[10].strip(), city, state))
 
-    # Clear old table records to wipe out previous mismatched data
     c.execute('DELETE FROM uls_callsigns')
 
     c.executemany('''
@@ -131,7 +129,7 @@ def query_uls(callsign):
     conn.close()
     if res:
         name = f"{res[0]} {res[1]}".strip()
-        loc = f"{res[2]}, {res[3]}".strip(", ")  # Formats cleanly as "City, ST"
+        loc = f"{res[2]}, {res[3]}".strip(", ")
         return name, loc
         
     return "", ""
@@ -157,7 +155,6 @@ class PastNetsDialog(QDialog):
         self.selected_net_id = None
 
         layout = QVBoxLayout(self)
-
         layout.addWidget(QLabel("Select a previous net session to view or re-export:"))
 
         self.list_widget = QListWidget()
@@ -179,7 +176,7 @@ class PastNetsDialog(QDialog):
                 FROM nets n
                 LEFT JOIN checkins c ON n.net_id = c.net_id
                 GROUP BY n.net_id
-                ORDER BY n.net_id DESC
+                ORDER BY n.net_id ASC
             ''')
             rows = c.fetchall()
             conn.close()
@@ -188,7 +185,7 @@ class PastNetsDialog(QDialog):
                 net_id, start_time, net_name, ctrl_call, ctrl_op, count = row
                 display_text = f"[{start_time}] #{net_id}: {net_name or 'Unnamed Net'} — Control: {ctrl_call or 'N/A'} ({ctrl_op or 'N/A'}) — Check-ins: {count}"
                 item = QListWidgetItem(display_text)
-                item.setData(100, net_id)  # Store net_id in custom user role
+                item.setData(100, net_id)
                 self.list_widget.addItem(item)
         except sqlite3.OperationalError as e:
             QMessageBox.critical(self, "Database Error", f"Error loading past nets:\n{e}")
@@ -271,17 +268,35 @@ class NetLoggerApp(QMainWindow):
         comment_layout = QHBoxLayout()
         self.comment_input = QLineEdit()
         self.comment_input.setPlaceholderText("Comments (Traffic, power, rig, etc.)")
-        
+
         log_btn = QPushButton("Log Check-In")
         log_btn.clicked.connect(self.log_checkin)
+
+        self.call_input.returnPressed.connect(self.log_checkin)
+        self.name_input.returnPressed.connect(self.log_checkin)
+        self.loc_input.returnPressed.connect(self.log_checkin)
+        self.comment_input.returnPressed.connect(self.log_checkin)
 
         comment_layout.addWidget(self.comment_input)
         comment_layout.addWidget(log_btn)
 
-        # Table Display
-        self.table = QTableWidget(0, 6)
-        self.table.setHorizontalHeaderLabels(["ID", "Timestamp", "Callsign", "Name", "Location", "Comments"])
+        # Table Display area with side controls
+        table_container_layout = QHBoxLayout()
+
+        # ONLY 5 COLUMNS VISIBLE
+        self.table = QTableWidget(0, 5)
+        self.table.setHorizontalHeaderLabels(["Timestamp", "Callsign", "Name", "Location", "Comments"])
         self.table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Stretch)
+
+        table_controls_layout = QVBoxLayout()
+        in_out_btn = QPushButton("In/Out")
+        in_out_btn.setToolTip("Append or toggle 'In/Out' on the selected row in the log")
+        in_out_btn.clicked.connect(self.toggle_in_out_selected)
+        table_controls_layout.addWidget(in_out_btn)
+        table_controls_layout.addStretch()
+
+        table_container_layout.addWidget(self.table)
+        table_container_layout.addLayout(table_controls_layout)
 
         # Action Buttons
         action_layout = QHBoxLayout()
@@ -308,11 +323,10 @@ class NetLoggerApp(QMainWindow):
         self.progress.setRange(0, 0)
         self.progress.hide()
 
-        # Assembly
         main_layout.addWidget(header_frame)
         main_layout.addLayout(form_layout)
         main_layout.addLayout(comment_layout)
-        main_layout.addWidget(self.table)
+        main_layout.addLayout(table_container_layout)
         main_layout.addLayout(action_layout)
         main_layout.addWidget(self.status_label)
         main_layout.addWidget(self.progress)
@@ -358,8 +372,6 @@ class NetLoggerApp(QMainWindow):
     def load_net_by_id(self, net_id):
         conn = sqlite3.connect(LOG_DB)
         c = conn.cursor()
-        
-        # Load net header info
         c.execute('SELECT net_name, control_callsign, control_operator FROM nets WHERE net_id = ?', (net_id,))
         net_meta = c.fetchone()
         if net_meta:
@@ -389,6 +401,37 @@ class NetLoggerApp(QMainWindow):
         ))
         conn.commit()
         conn.close()
+
+    def toggle_in_out_selected(self):
+        selected_row = self.table.currentRow()
+        if selected_row < 0:
+            QMessageBox.information(self, "Selection Required", "Please select a check-in from the table first.")
+            return
+
+        # Hidden DB ID is stored on Column 0 (Timestamp)
+        timestamp_item = self.table.item(selected_row, 0)
+        if not timestamp_item:
+            return
+        
+        checkin_id = timestamp_item.data(Qt.ItemDataRole.UserRole)
+        comment_item = self.table.item(selected_row, 4)  # Column 4 is Comments
+        existing_comment = comment_item.text().strip() if comment_item else ""
+
+        if "In/Out" in existing_comment:
+            new_comment = existing_comment.replace("In/Out", "").strip()
+        elif existing_comment:
+            new_comment = f"{existing_comment} In/Out"
+        else:
+            new_comment = "In/Out"
+
+        conn = sqlite3.connect(LOG_DB)
+        c = conn.cursor()
+        c.execute('UPDATE checkins SET comments = ? WHERE id = ?', (new_comment, checkin_id))
+        conn.commit()
+        conn.close()
+
+        self.load_session_logs()
+        self.table.selectRow(selected_row)
 
     def log_checkin(self):
         call = self.call_input.text().strip().upper()
@@ -428,16 +471,23 @@ class NetLoggerApp(QMainWindow):
             SELECT id, timestamp, callsign, name, location, comments 
             FROM checkins 
             WHERE net_id = ? 
-            ORDER BY id DESC
+            ORDER BY id ASC
         ''', (self.current_net_id,))
         rows = c.fetchall()
         conn.close()
 
         self.table.setRowCount(0)
         for row_idx, row_data in enumerate(rows):
+            checkin_id = row_data[0]
+            display_data = row_data[1:]  # [Timestamp, Callsign, Name, Location, Comments]
+            
             self.table.insertRow(row_idx)
-            for col_idx, value in enumerate(row_data):
-                self.table.setItem(row_idx, col_idx, QTableWidgetItem(str(value)))
+            for col_idx, value in enumerate(display_data):
+                item = QTableWidgetItem(str(value or ""))
+                if col_idx == 0:
+                    # Store database ID as hidden UserRole data on the Timestamp item
+                    item.setData(Qt.ItemDataRole.UserRole, checkin_id)
+                self.table.setItem(row_idx, col_idx, item)
 
     def start_uls_update(self):
         self.progress.show()
