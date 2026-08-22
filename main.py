@@ -8,11 +8,13 @@ from PyQt6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout,
                              QHBoxLayout, QLabel, QLineEdit, QPushButton, 
                              QTableWidget, QTableWidgetItem, QHeaderView, 
                              QMessageBox, QFileDialog, QProgressBar, QFrame,
-                             QDialog, QListWidget, QListWidgetItem, QDialogButtonBox)
+                             QDialog, QListWidget, QListWidgetItem, QDialogButtonBox,
+                             QComboBox)
 from PyQt6.QtCore import QThread, pyqtSignal, Qt
 
 ULS_DB = "uls_cache.db"
 LOG_DB = "net_logs.db"
+APP_VERSION = "v1.03"
 
 # -------------------------------------------------------------------
 # DATABASE FUNCTIONS
@@ -37,15 +39,19 @@ def init_databases():
             callsign TEXT,
             name TEXT,
             location TEXT,
+            status TEXT,
             comments TEXT,
             FOREIGN KEY (net_id) REFERENCES nets(net_id)
         )
     ''')
     
+    # Auto-migration checks for existing databases
     c.execute("PRAGMA table_info(checkins)")
     columns = [col[1] for col in c.fetchall()]
     if 'net_id' not in columns:
         c.execute("ALTER TABLE checkins ADD COLUMN net_id INTEGER")
+    if 'status' not in columns:
+        c.execute("ALTER TABLE checkins ADD COLUMN status TEXT DEFAULT 'General'")
         
     conn.commit()
     conn.close()
@@ -212,8 +218,8 @@ class ULSUpdateThread(QThread):
 class NetLoggerApp(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("Net Control Logger")
-        self.resize(1000, 650)
+        self.setWindowTitle(f"Net Control Logger - {APP_VERSION}")
+        self.resize(1050, 650)
         self.current_net_id = None
         
         init_databases()
@@ -244,7 +250,7 @@ class NetLoggerApp(QMainWindow):
         header_layout.addWidget(QLabel("<b>Operator Name:</b>"))
         header_layout.addWidget(self.control_op_input)
 
-        # Input Form
+        # Input Form Row 1: Call, Name, Loc, Status
         form_layout = QHBoxLayout()
         
         self.call_input = QLineEdit()
@@ -257,14 +263,19 @@ class NetLoggerApp(QMainWindow):
         self.loc_input = QLineEdit()
         self.loc_input.setPlaceholderText("Location")
 
+        self.status_dropdown = QComboBox()
+        self.status_dropdown.addItems(["General", "Mobile", "Portable", "Short Time", "In/Out"])
+
         form_layout.addWidget(QLabel("Call:"))
         form_layout.addWidget(self.call_input)
         form_layout.addWidget(QLabel("Name:"))
         form_layout.addWidget(self.name_input)
         form_layout.addWidget(QLabel("Loc:"))
         form_layout.addWidget(self.loc_input)
+        form_layout.addWidget(QLabel("Status:"))
+        form_layout.addWidget(self.status_dropdown)
 
-        # Comments Box & Log Button
+        # Input Form Row 2: Comments Box & Log Button
         comment_layout = QHBoxLayout()
         self.comment_input = QLineEdit()
         self.comment_input.setPlaceholderText("Comments (Traffic, power, rig, etc.)")
@@ -280,23 +291,10 @@ class NetLoggerApp(QMainWindow):
         comment_layout.addWidget(self.comment_input)
         comment_layout.addWidget(log_btn)
 
-        # Table Display area with side controls
-        table_container_layout = QHBoxLayout()
-
-        # ONLY 5 COLUMNS VISIBLE
-        self.table = QTableWidget(0, 5)
-        self.table.setHorizontalHeaderLabels(["Timestamp", "Callsign", "Name", "Location", "Comments"])
+        # Table Display Area (6 Columns)
+        self.table = QTableWidget(0, 6)
+        self.table.setHorizontalHeaderLabels(["Timestamp", "Callsign", "Name", "Location", "Status", "Comments"])
         self.table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Stretch)
-
-        table_controls_layout = QVBoxLayout()
-        in_out_btn = QPushButton("In/Out")
-        in_out_btn.setToolTip("Append or toggle 'In/Out' on the selected row in the log")
-        in_out_btn.clicked.connect(self.toggle_in_out_selected)
-        table_controls_layout.addWidget(in_out_btn)
-        table_controls_layout.addStretch()
-
-        table_container_layout.addWidget(self.table)
-        table_container_layout.addLayout(table_controls_layout)
 
         # Action Buttons
         action_layout = QHBoxLayout()
@@ -318,7 +316,15 @@ class NetLoggerApp(QMainWindow):
         action_layout.addWidget(update_btn)
         action_layout.addWidget(export_btn)
 
+        # Footer Status & Version Bar
+        footer_layout = QHBoxLayout()
         self.status_label = QLabel("Ready")
+        version_label = QLabel(f"<b>NetPal {APP_VERSION}</b>")
+        
+        footer_layout.addWidget(self.status_label)
+        footer_layout.addStretch()
+        footer_layout.addWidget(version_label)
+
         self.progress = QProgressBar()
         self.progress.setRange(0, 0)
         self.progress.hide()
@@ -326,9 +332,9 @@ class NetLoggerApp(QMainWindow):
         main_layout.addWidget(header_frame)
         main_layout.addLayout(form_layout)
         main_layout.addLayout(comment_layout)
-        main_layout.addLayout(table_container_layout)
+        main_layout.addWidget(self.table)
         main_layout.addLayout(action_layout)
-        main_layout.addWidget(self.status_label)
+        main_layout.addLayout(footer_layout)
         main_layout.addWidget(self.progress)
 
         container = QWidget()
@@ -362,6 +368,7 @@ class NetLoggerApp(QMainWindow):
         self.name_input.clear()
         self.loc_input.clear()
         self.comment_input.clear()
+        self.status_dropdown.setCurrentIndex(0)  # Default to 'General'
         self.status_label.setText(f"Active Net Session #{self.current_net_id}")
 
     def load_past_net_dialog(self):
@@ -402,41 +409,11 @@ class NetLoggerApp(QMainWindow):
         conn.commit()
         conn.close()
 
-    def toggle_in_out_selected(self):
-        selected_row = self.table.currentRow()
-        if selected_row < 0:
-            QMessageBox.information(self, "Selection Required", "Please select a check-in from the table first.")
-            return
-
-        # Hidden DB ID is stored on Column 0 (Timestamp)
-        timestamp_item = self.table.item(selected_row, 0)
-        if not timestamp_item:
-            return
-        
-        checkin_id = timestamp_item.data(Qt.ItemDataRole.UserRole)
-        comment_item = self.table.item(selected_row, 4)  # Column 4 is Comments
-        existing_comment = comment_item.text().strip() if comment_item else ""
-
-        if "In/Out" in existing_comment:
-            new_comment = existing_comment.replace("In/Out", "").strip()
-        elif existing_comment:
-            new_comment = f"{existing_comment} In/Out"
-        else:
-            new_comment = "In/Out"
-
-        conn = sqlite3.connect(LOG_DB)
-        c = conn.cursor()
-        c.execute('UPDATE checkins SET comments = ? WHERE id = ?', (new_comment, checkin_id))
-        conn.commit()
-        conn.close()
-
-        self.load_session_logs()
-        self.table.selectRow(selected_row)
-
     def log_checkin(self):
         call = self.call_input.text().strip().upper()
         name = self.name_input.text().strip()
         loc = self.loc_input.text().strip()
+        status = self.status_dropdown.currentText()
         comment = self.comment_input.text().strip()
 
         if not call or not self.current_net_id:
@@ -448,9 +425,9 @@ class NetLoggerApp(QMainWindow):
         conn = sqlite3.connect(LOG_DB)
         c = conn.cursor()
         c.execute('''
-            INSERT INTO checkins (net_id, callsign, name, location, comments, timestamp)
-            VALUES (?, ?, ?, ?, ?, datetime('now', 'localtime'))
-        ''', (self.current_net_id, call, name, loc, comment))
+            INSERT INTO checkins (net_id, callsign, name, location, status, comments, timestamp)
+            VALUES (?, ?, ?, ?, ?, ?, datetime('now', 'localtime'))
+        ''', (self.current_net_id, call, name, loc, status, comment))
         conn.commit()
         conn.close()
 
@@ -458,6 +435,7 @@ class NetLoggerApp(QMainWindow):
         self.name_input.clear()
         self.loc_input.clear()
         self.comment_input.clear()
+        self.status_dropdown.setCurrentIndex(0)  # Reset dropdown to General
         self.call_input.setFocus()
         self.load_session_logs()
 
@@ -468,7 +446,7 @@ class NetLoggerApp(QMainWindow):
         conn = sqlite3.connect(LOG_DB)
         c = conn.cursor()
         c.execute('''
-            SELECT id, timestamp, callsign, name, location, comments 
+            SELECT id, timestamp, callsign, name, location, status, comments 
             FROM checkins 
             WHERE net_id = ? 
             ORDER BY id ASC
@@ -479,13 +457,12 @@ class NetLoggerApp(QMainWindow):
         self.table.setRowCount(0)
         for row_idx, row_data in enumerate(rows):
             checkin_id = row_data[0]
-            display_data = row_data[1:]  # [Timestamp, Callsign, Name, Location, Comments]
+            display_data = row_data[1:]  # [Timestamp, Callsign, Name, Location, Status, Comments]
             
             self.table.insertRow(row_idx)
             for col_idx, value in enumerate(display_data):
                 item = QTableWidgetItem(str(value or ""))
                 if col_idx == 0:
-                    # Store database ID as hidden UserRole data on the Timestamp item
                     item.setData(Qt.ItemDataRole.UserRole, checkin_id)
                 self.table.setItem(row_idx, col_idx, item)
 
@@ -513,7 +490,7 @@ class NetLoggerApp(QMainWindow):
             c.execute('SELECT net_name, control_callsign, control_operator, start_time FROM nets WHERE net_id = ?', (self.current_net_id,))
             net_meta = c.fetchone()
 
-            c.execute('SELECT id, timestamp, callsign, name, location, comments FROM checkins WHERE net_id = ?', (self.current_net_id,))
+            c.execute('SELECT id, timestamp, callsign, name, location, status, comments FROM checkins WHERE net_id = ?', (self.current_net_id,))
             rows = c.fetchall()
             conn.close()
 
@@ -521,7 +498,7 @@ class NetLoggerApp(QMainWindow):
                 writer = csv.writer(f)
                 writer.writerow(["Net Name:", net_meta[0], "Control Call:", net_meta[1], "Control Op:", net_meta[2], "Started:", net_meta[3]])
                 writer.writerow([])
-                writer.writerow(["ID", "Timestamp", "Callsign", "Name", "Location", "Comments"])
+                writer.writerow(["ID", "Timestamp", "Callsign", "Name", "Location", "Status", "Comments"])
                 writer.writerows(rows)
             QMessageBox.information(self, "Export Complete", f"Session #{self.current_net_id} logs exported to {path}")
 
