@@ -10,11 +10,11 @@ from PyQt6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout,
                              QMessageBox, QFileDialog, QProgressBar, QFrame,
                              QDialog, QListWidget, QListWidgetItem, QDialogButtonBox,
                              QComboBox)
-from PyQt6.QtCore import QThread, pyqtSignal, Qt
+from PyQt6.QtCore import QThread, pyqtSignal, Qt, QEvent
 
 ULS_DB = "uls_cache.db"
 LOG_DB = "net_logs.db"
-APP_VERSION = "v1.03"
+APP_VERSION = "v1.04"
 
 # -------------------------------------------------------------------
 # DATABASE FUNCTIONS
@@ -218,7 +218,7 @@ class ULSUpdateThread(QThread):
 class NetLoggerApp(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle(f"Net Control Logger - {APP_VERSION}")
+        self.setWindowTitle(f"NetPal - {APP_VERSION}")
         self.resize(1050, 650)
         self.current_net_id = None
         
@@ -265,6 +265,8 @@ class NetLoggerApp(QMainWindow):
 
         self.status_dropdown = QComboBox()
         self.status_dropdown.addItems(["General", "Mobile", "Portable", "Short Time", "In/Out"])
+        # Event filter allows pressing Enter while focused on dropdown to log contact
+        self.status_dropdown.installEventFilter(self)
 
         form_layout.addWidget(QLabel("Call:"))
         form_layout.addWidget(self.call_input)
@@ -341,6 +343,14 @@ class NetLoggerApp(QMainWindow):
         container.setLayout(main_layout)
         self.setCentralWidget(container)
 
+    def eventFilter(self, source, event):
+        # Capture Enter keypresses directly on the Status dropdown
+        if source == self.status_dropdown and event.type() == QEvent.Type.KeyPress:
+            if event.key() in (Qt.Key.Key_Return, Qt.Key.Key_Enter):
+                self.log_checkin()
+                return True
+        return super().eventFilter(source, event)
+
     def on_callsign_typed(self, text):
         call = text.strip().upper()
         if len(call) >= 3:
@@ -416,6 +426,7 @@ class NetLoggerApp(QMainWindow):
         status = self.status_dropdown.currentText()
         comment = self.comment_input.text().strip()
 
+        # Check callsign and active session presence before logging
         if not call or not self.current_net_id:
             return
 
