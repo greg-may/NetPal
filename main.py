@@ -4,6 +4,7 @@ import sqlite3
 import zipfile
 import urllib.request
 import os
+import io
 from PyQt6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout, 
                              QHBoxLayout, QLabel, QLineEdit, QPushButton, 
                              QTableWidget, QTableWidgetItem, QHeaderView, 
@@ -14,6 +15,7 @@ from PyQt6.QtCore import QThread, pyqtSignal, Qt, QEvent
 
 ULS_DB = "uls_cache.db"
 LOG_DB = "net_logs.db"
+TEMP_DB = "uls_temp.db"
 APP_VERSION = "v1.05"
 
 # -------------------------------------------------------------------
@@ -60,13 +62,15 @@ def init_databases():
     c = conn.cursor()
     c.execute('''
         CREATE TABLE IF NOT EXISTS uls_callsigns (
-            callsign TEXT PRIMARY KEY,
+            usi INTEGER PRIMARY KEY,
+            callsign TEXT UNIQUE,
             first_name TEXT,
             last_name TEXT,
             city TEXT,
             state TEXT
         )
     ''')
+    c.execute('CREATE INDEX IF NOT EXISTS idx_callsign ON uls_callsigns (callsign)')
     c.execute('''
         CREATE TABLE IF NOT EXISTS user_overrides (
             callsign TEXT PRIMARY KEY,
@@ -77,62 +81,170 @@ def init_databases():
     conn.commit()
     conn.close()
 
+def download_file(url, target_path):
+    headers = {
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
+    }
+    try:
+        import requests
+        with requests.get(url, headers=headers, stream=True) as r:
+            r.raise_for_status()
+            with open(target_path, 'wb') as f:
+                for chunk in r.iter_content(chunk_size=65536):
+                    f.write(chunk)
+    except ImportError:
+        req = urllib.request.Request(url, headers=headers)
+        with urllib.request.urlopen(req) as resp, open(target_path, 'wb') as out:
+            out.write(resp.read())
+
 def update_uls_db(status_callback=None):
+    init_databases()
+    
     url = "https://data.fcc.gov/download/pub/uls/complete/l_amat.zip"
     zip_path = "l_amat.zip"
     
     if status_callback: status_callback("Downloading FCC ULS Database...")
-    urllib.request.urlretrieve(url, zip_path)
-    
-    if status_callback: status_callback("Extracting EN.dat...")
-    with zipfile.ZipFile(zip_path, 'r') as zip_ref:
-        zip_ref.extract('EN.dat')
+    download_file(url, zip_path)
 
-    if status_callback: status_callback("Appending new records into SQLite...")
+    if os.path.exists(TEMP_DB):
+        os.remove(TEMP_DB)
+
+    temp_conn = sqlite3.connect(TEMP_DB)
+    temp_c = temp_conn.cursor()
+
+    # Staging Tables
+    temp_c.execute('CREATE TABLE hd_raw (unique_system_identifier INT, license_status TEXT)')
+    temp_c.execute('CREATE TABLE am_raw (unique_system_identifier INT)')
+    temp_c.execute('''
+        CREATE TABLE en_raw (
+            unique_system_identifier INT, 
+            callsign TEXT, 
+            first_name TEXT, 
+            last_name TEXT, 
+            city TEXT, 
+            state TEXT,
+            entity_type TEXT,
+            entity_name TEXT
+        )
+    ''')
+
+    with zipfile.ZipFile(zip_path, 'r') as zip_ref:
+        # HD.dat
+        if status_callback: status_callback("Importing HD.dat...")
+        with zip_ref.open('HD.dat') as f:
+            reader = csv.reader(io.TextIOWrapper(f, encoding='latin-1'), delimiter='|')
+            rows = []
+            for r in reader:
+                if len(r) > 5 and r[0] == 'HD':
+                    try:
+                        rows.append((int(r[1].strip()), r[5].strip()))
+                    except ValueError:
+                        continue
+            temp_c.executemany('INSERT INTO hd_raw VALUES (?, ?)', rows)
+
+        # AM.dat
+        if status_callback: status_callback("Importing AM.dat...")
+        with zip_ref.open('AM.dat') as f:
+            reader = csv.reader(io.TextIOWrapper(f, encoding='latin-1'), delimiter='|')
+            rows = []
+            for r in reader:
+                if len(r) > 1 and r[0] == 'AM':
+                    try:
+                        rows.append((int(r[1].strip()),))
+                    except ValueError:
+                        continue
+            temp_c.executemany('INSERT INTO am_raw VALUES (?)', rows)
+
+        # EN.dat
+        if status_callback: status_callback("Importing EN.dat...")
+        with zip_ref.open('EN.dat') as f:
+            reader = csv.reader(io.TextIOWrapper(f, encoding='latin-1'), delimiter='|')
+            rows = []
+            for r in reader:
+                if len(r) > 17 and r[0] == 'EN':
+                    try:
+                        usi = int(r[1].strip())
+                        call = r[4].strip().upper() if len(r) > 4 else ''
+                        entity_type = r[5].strip() if len(r) > 5 else ''
+                        entity_name = r[7].strip() if len(r) > 7 else ''
+                        first = r[8].strip() if len(r) > 8 else ''
+                        last = r[10].strip() if len(r) > 10 else ''
+                        city = r[16].strip() if len(r) > 16 else ''
+                        state = r[17].strip() if len(r) > 17 else ''
+                        
+                        if not first and not last:
+                            first = entity_name
+
+                        rows.append((usi, call, first, last, city, state, entity_type, entity_name))
+                    except ValueError:
+                        continue
+            temp_c.executemany('INSERT INTO en_raw VALUES (?, ?, ?, ?, ?, ?, ?, ?)', rows)
+
+    if status_callback: status_callback("Indexing temp tables...")
+    temp_c.execute('CREATE INDEX idx_hd_usi ON hd_raw (unique_system_identifier)')
+    temp_c.execute('CREATE INDEX idx_am_usi ON am_raw (unique_system_identifier)')
+    temp_c.execute('CREATE INDEX idx_en_usi ON en_raw (unique_system_identifier)')
+    temp_conn.commit()
+
+    if status_callback: status_callback("Running license query...")
+    exact_user_query = '''
+        SELECT DISTINCT 
+            e.unique_system_identifier, 
+            e.callsign, 
+            e.first_name, 
+            e.last_name, 
+            e.city, 
+            e.state 
+        FROM en_raw e
+        JOIN am_raw a ON e.unique_system_identifier = a.unique_system_identifier
+        JOIN hd_raw hd ON e.unique_system_identifier = hd.unique_system_identifier
+        WHERE hd.license_status = 'A'
+    '''
+    active_records = temp_c.execute(exact_user_query).fetchall()
+
+    if status_callback: status_callback("Writing to cache...")
     conn = sqlite3.connect(ULS_DB)
     c = conn.cursor()
-    
-    to_db = []
-    with open('EN.dat', 'r', encoding='latin-1') as f:
-        reader = csv.reader(f, delimiter='|')
-        for row in reader:
-            if len(row) > 17 and row[0] == 'EN':
-                call = row[4].strip()
-                city = row[16].strip()
-                state = row[17].strip()
-                if call:
-                    to_db.append((call, row[8].strip(), row[10].strip(), city, state))
-
     c.execute('DELETE FROM uls_callsigns')
-
     c.executemany('''
-        INSERT OR REPLACE INTO uls_callsigns (callsign, first_name, last_name, city, state)
-        VALUES (?, ?, ?, ?, ?)
-    ''', to_db)
+        INSERT OR REPLACE INTO uls_callsigns (usi, callsign, first_name, last_name, city, state)
+        VALUES (?, ?, ?, ?, ?, ?)
+    ''', active_records)
     conn.commit()
     conn.close()
 
-    os.remove(zip_path)
-    os.remove('EN.dat')
+    temp_conn.close()
+
+    for file in [zip_path, TEMP_DB]:
+        if os.path.exists(file):
+            os.remove(file)
+
     if status_callback: status_callback("Update complete!")
 
 def query_uls(callsign):
     if not os.path.exists(ULS_DB):
         return "", ""
-    
-    callsign = callsign.upper()
+        
+    callsign = callsign.strip().upper()
     conn = sqlite3.connect(ULS_DB)
     c = conn.cursor()
     
+    # Check user overrides first
     c.execute('SELECT preferred_name, preferred_location FROM user_overrides WHERE callsign = ?', (callsign,))
     override = c.fetchone()
     if override:
         conn.close()
         return override[0], override[1]
 
-    c.execute('SELECT first_name, last_name, city, state FROM uls_callsigns WHERE callsign = ?', (callsign,))
+    # Query active ULS callsigns
+    c.execute('''
+        SELECT first_name, last_name, city, state 
+        FROM uls_callsigns 
+        WHERE callsign = ?
+    ''', (callsign,))
     res = c.fetchone()
     conn.close()
+    
     if res:
         name = f"{res[0]} {res[1]}".strip()
         loc = f"{res[2]}, {res[3]}".strip(", ")
@@ -147,6 +259,13 @@ def save_user_override(callsign, name, location):
         INSERT OR REPLACE INTO user_overrides (callsign, preferred_name, preferred_location)
         VALUES (?, ?, ?)
     ''', (callsign.upper(), name, location))
+    conn.commit()
+    conn.close()
+
+def delete_checkin_by_id(checkin_id):
+    conn = sqlite3.connect(LOG_DB)
+    c = conn.cursor()
+    c.execute('DELETE FROM checkins WHERE id = ?', (checkin_id,))
     conn.commit()
     conn.close()
 
@@ -292,14 +411,20 @@ class NetLoggerApp(QMainWindow):
         comment_layout.addWidget(self.comment_input)
         comment_layout.addWidget(log_btn)
 
-        # Table Display Area (7 Columns - Action added)
+        # Table Display Area (7 Columns: Timestamp, Call, Name, Loc, Status, Comments, Action)
         self.table = QTableWidget(0, 7)
-        self.table.setHorizontalHeaderLabels(["Action", "Timestamp", "Callsign", "Name", "Location", "Status", "Comments"])
+        self.table.setHorizontalHeaderLabels(["Timestamp", "Callsign", "Name", "Location", "Status", "Comments", "Action"])
         
+        # Set column resize modes: Stretch main columns, keep Action column fixed size
         header = self.table.horizontalHeader()
-        header.setSectionResizeMode(QHeaderView.ResizeMode.Stretch)
-        header.setSectionResizeMode(0, QHeaderView.ResizeMode.Fixed)
-        self.table.setColumnWidth(0, 60)  # Compact width for the delete column
+        header.setSectionResizeMode(0, QHeaderView.ResizeMode.Interactive)
+        header.setSectionResizeMode(1, QHeaderView.ResizeMode.Interactive)
+        header.setSectionResizeMode(2, QHeaderView.ResizeMode.Interactive)
+        header.setSectionResizeMode(3, QHeaderView.ResizeMode.Interactive)
+        header.setSectionResizeMode(4, QHeaderView.ResizeMode.Interactive)
+        header.setSectionResizeMode(5, QHeaderView.ResizeMode.Stretch)
+        header.setSectionResizeMode(6, QHeaderView.ResizeMode.Fixed)
+        self.table.setColumnWidth(6, 60)
 
         # Action Buttons
         action_layout = QHBoxLayout()
@@ -451,6 +576,19 @@ class NetLoggerApp(QMainWindow):
         self.call_input.setFocus()
         self.load_session_logs()
 
+    def confirm_delete_checkin(self, checkin_id, callsign):
+        reply = QMessageBox.question(
+            self,
+            "Confirm Delete",
+            f"Are you sure you want to delete the check-in for {callsign}?",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No
+        )
+
+        if reply == QMessageBox.StandardButton.Yes:
+            delete_checkin_by_id(checkin_id)
+            self.load_session_logs()
+            self.status_label.setText(f"Deleted check-in record #{checkin_id}")
+
     def load_session_logs(self):
         if not self.current_net_id:
             return
@@ -470,50 +608,32 @@ class NetLoggerApp(QMainWindow):
         for row_idx, row_data in enumerate(rows):
             checkin_id = row_data[0]
             display_data = row_data[1:]  # [Timestamp, Callsign, Name, Location, Status, Comments]
-            
-            self.table.insertRow(row_idx)
+            callsign = row_data[2] or "Unknown"
 
-            # Column 0: Delete button styled as a red X
-            del_btn = QPushButton("✖")
-            del_btn.setToolTip("Delete this entry")
-            del_btn.setStyleSheet("""
+            self.table.insertRow(row_idx)
+            for col_idx, value in enumerate(display_data):
+                item = QTableWidgetItem(str(value or ""))
+                self.table.setItem(row_idx, col_idx, item)
+
+            # Add Red 'X' Delete Button to the Action column (Column index 6)
+            delete_btn = QPushButton("✕")
+            delete_btn.setToolTip("Delete this check-in")
+            delete_btn.setStyleSheet("""
                 QPushButton {
                     color: red; 
                     font-weight: bold; 
+                    font-size: 14px; 
                     border: none;
                     background: transparent;
-                    font-size: 14px;
                 }
                 QPushButton:hover {
                     color: darkred;
-                    background-color: #ffcccc;
+                    background-color: #ffeeee;
                     border-radius: 3px;
                 }
             """)
-            # Connect row deletion passing the database row ID
-            del_btn.clicked.connect(lambda _, cid=checkin_id: self.delete_checkin(cid))
-            self.table.setCellWidget(row_idx, 0, del_btn)
-
-            # Columns 1-6: Log fields
-            for col_idx, value in enumerate(display_data):
-                item = QTableWidgetItem(str(value or ""))
-                self.table.setItem(row_idx, col_idx + 1, item)
-
-    def delete_checkin(self, checkin_id):
-        reply = QMessageBox.question(
-            self, 
-            "Confirm Delete", 
-            "Are you sure you want to remove this check-in entry?",
-            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
-            QMessageBox.StandardButton.No
-        )
-        if reply == QMessageBox.StandardButton.Yes:
-            conn = sqlite3.connect(LOG_DB)
-            c = conn.cursor()
-            c.execute("DELETE FROM checkins WHERE id = ?", (checkin_id,))
-            conn.commit()
-            conn.close()
-            self.load_session_logs()
+            delete_btn.clicked.connect(lambda _, cid=checkin_id, cs=callsign: self.confirm_delete_checkin(cid, cs))
+            self.table.setCellWidget(row_idx, 6, delete_btn)
 
     def start_uls_update(self):
         self.progress.show()
@@ -524,7 +644,7 @@ class NetLoggerApp(QMainWindow):
 
     def update_finished(self):
         self.progress.hide()
-        QMessageBox.information(self, "Update", "FCC ULS Database updated without disturbing existing records!")
+        QMessageBox.information(self, "Update", "FCC ULS Database updated successfully!")
 
     def export_csv(self):
         if not self.current_net_id:
