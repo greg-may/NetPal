@@ -14,7 +14,7 @@ from PyQt6.QtCore import QThread, pyqtSignal, Qt, QEvent
 
 ULS_DB = "uls_cache.db"
 LOG_DB = "net_logs.db"
-APP_VERSION = "v1.04"
+APP_VERSION = "v1.05"
 
 # -------------------------------------------------------------------
 # DATABASE FUNCTIONS
@@ -265,7 +265,6 @@ class NetLoggerApp(QMainWindow):
 
         self.status_dropdown = QComboBox()
         self.status_dropdown.addItems(["General", "Mobile", "Portable", "Short Time", "In/Out"])
-        # Event filter allows pressing Enter while focused on dropdown to log contact
         self.status_dropdown.installEventFilter(self)
 
         form_layout.addWidget(QLabel("Call:"))
@@ -293,10 +292,14 @@ class NetLoggerApp(QMainWindow):
         comment_layout.addWidget(self.comment_input)
         comment_layout.addWidget(log_btn)
 
-        # Table Display Area (6 Columns)
-        self.table = QTableWidget(0, 6)
-        self.table.setHorizontalHeaderLabels(["Timestamp", "Callsign", "Name", "Location", "Status", "Comments"])
-        self.table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Stretch)
+        # Table Display Area (7 Columns - Action added)
+        self.table = QTableWidget(0, 7)
+        self.table.setHorizontalHeaderLabels(["Action", "Timestamp", "Callsign", "Name", "Location", "Status", "Comments"])
+        
+        header = self.table.horizontalHeader()
+        header.setSectionResizeMode(QHeaderView.ResizeMode.Stretch)
+        header.setSectionResizeMode(0, QHeaderView.ResizeMode.Fixed)
+        self.table.setColumnWidth(0, 60)  # Compact width for the delete column
 
         # Action Buttons
         action_layout = QHBoxLayout()
@@ -344,7 +347,6 @@ class NetLoggerApp(QMainWindow):
         self.setCentralWidget(container)
 
     def eventFilter(self, source, event):
-        # Capture Enter keypresses directly on the Status dropdown
         if source == self.status_dropdown and event.type() == QEvent.Type.KeyPress:
             if event.key() in (Qt.Key.Key_Return, Qt.Key.Key_Enter):
                 self.log_checkin()
@@ -378,7 +380,7 @@ class NetLoggerApp(QMainWindow):
         self.name_input.clear()
         self.loc_input.clear()
         self.comment_input.clear()
-        self.status_dropdown.setCurrentIndex(0)  # Default to 'General'
+        self.status_dropdown.setCurrentIndex(0)
         self.status_label.setText(f"Active Net Session #{self.current_net_id}")
 
     def load_past_net_dialog(self):
@@ -426,7 +428,6 @@ class NetLoggerApp(QMainWindow):
         status = self.status_dropdown.currentText()
         comment = self.comment_input.text().strip()
 
-        # Check callsign and active session presence before logging
         if not call or not self.current_net_id:
             return
 
@@ -446,7 +447,7 @@ class NetLoggerApp(QMainWindow):
         self.name_input.clear()
         self.loc_input.clear()
         self.comment_input.clear()
-        self.status_dropdown.setCurrentIndex(0)  # Reset dropdown to General
+        self.status_dropdown.setCurrentIndex(0)
         self.call_input.setFocus()
         self.load_session_logs()
 
@@ -471,11 +472,48 @@ class NetLoggerApp(QMainWindow):
             display_data = row_data[1:]  # [Timestamp, Callsign, Name, Location, Status, Comments]
             
             self.table.insertRow(row_idx)
+
+            # Column 0: Delete button styled as a red X
+            del_btn = QPushButton("✖")
+            del_btn.setToolTip("Delete this entry")
+            del_btn.setStyleSheet("""
+                QPushButton {
+                    color: red; 
+                    font-weight: bold; 
+                    border: none;
+                    background: transparent;
+                    font-size: 14px;
+                }
+                QPushButton:hover {
+                    color: darkred;
+                    background-color: #ffcccc;
+                    border-radius: 3px;
+                }
+            """)
+            # Connect row deletion passing the database row ID
+            del_btn.clicked.connect(lambda _, cid=checkin_id: self.delete_checkin(cid))
+            self.table.setCellWidget(row_idx, 0, del_btn)
+
+            # Columns 1-6: Log fields
             for col_idx, value in enumerate(display_data):
                 item = QTableWidgetItem(str(value or ""))
-                if col_idx == 0:
-                    item.setData(Qt.ItemDataRole.UserRole, checkin_id)
-                self.table.setItem(row_idx, col_idx, item)
+                self.table.setItem(row_idx, col_idx + 1, item)
+
+    def delete_checkin(self, checkin_id):
+        reply = QMessageBox.question(
+            self, 
+            "Confirm Delete", 
+            "Are you sure you want to remove this check-in entry?",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No
+        )
+        if reply == QMessageBox.StandardButton.Yes:
+            conn = sqlite3.connect(LOG_DB)
+            c = conn.cursor()
+            c.execute("DELETE FROM checkins WHERE id = ?", (checkin_id,))
+            conn.commit()
+            conn.close()
+            self.load_session_logs()
 
     def start_uls_update(self):
         self.progress.show()
