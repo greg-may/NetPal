@@ -10,13 +10,16 @@ from PyQt6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout,
                              QTableWidget, QTableWidgetItem, QHeaderView, 
                              QMessageBox, QFileDialog, QProgressBar, QFrame,
                              QDialog, QListWidget, QListWidgetItem, QDialogButtonBox,
-                             QComboBox)
+                             QComboBox, QKeySequenceEdit, QFormLayout)
 from PyQt6.QtCore import QThread, pyqtSignal, Qt, QEvent
+from PyQt6.QtGui import QKeySequence, QShortcut, QAction
 
 ULS_DB = "uls_cache.db"
 LOG_DB = "net_logs.db"
 TEMP_DB = "uls_temp.db"
-APP_VERSION = "v1.05"
+APP_VERSION = "v1.06"
+
+STATUS_OPTIONS = ["General", "Mobile", "Portable", "Short Time", "In/Out"]
 
 # -------------------------------------------------------------------
 # DATABASE FUNCTIONS
@@ -129,7 +132,6 @@ def update_uls_db(status_callback=None):
     ''')
 
     with zipfile.ZipFile(zip_path, 'r') as zip_ref:
-        # HD.dat
         if status_callback: status_callback("Importing HD.dat...")
         with zip_ref.open('HD.dat') as f:
             reader = csv.reader(io.TextIOWrapper(f, encoding='latin-1'), delimiter='|')
@@ -142,7 +144,6 @@ def update_uls_db(status_callback=None):
                         continue
             temp_c.executemany('INSERT INTO hd_raw VALUES (?, ?)', rows)
 
-        # AM.dat
         if status_callback: status_callback("Importing AM.dat...")
         with zip_ref.open('AM.dat') as f:
             reader = csv.reader(io.TextIOWrapper(f, encoding='latin-1'), delimiter='|')
@@ -155,7 +156,6 @@ def update_uls_db(status_callback=None):
                         continue
             temp_c.executemany('INSERT INTO am_raw VALUES (?)', rows)
 
-        # EN.dat
         if status_callback: status_callback("Importing EN.dat...")
         with zip_ref.open('EN.dat') as f:
             reader = csv.reader(io.TextIOWrapper(f, encoding='latin-1'), delimiter='|')
@@ -229,14 +229,12 @@ def query_uls(callsign):
     conn = sqlite3.connect(ULS_DB)
     c = conn.cursor()
     
-    # Check user overrides first
     c.execute('SELECT preferred_name, preferred_location FROM user_overrides WHERE callsign = ?', (callsign,))
     override = c.fetchone()
     if override:
         conn.close()
         return override[0], override[1]
 
-    # Query active ULS callsigns
     c.execute('''
         SELECT first_name, last_name, city, state 
         FROM uls_callsigns 
@@ -268,6 +266,48 @@ def delete_checkin_by_id(checkin_id):
     c.execute('DELETE FROM checkins WHERE id = ?', (checkin_id,))
     conn.commit()
     conn.close()
+
+def update_checkin_status_by_id(checkin_id, new_status):
+    conn = sqlite3.connect(LOG_DB)
+    c = conn.cursor()
+    c.execute('UPDATE checkins SET status = ? WHERE id = ?', (new_status, checkin_id))
+    conn.commit()
+    conn.close()
+
+# -------------------------------------------------------------------
+# HOTKEY CONFIGURATION DIALOG
+# -------------------------------------------------------------------
+class HotkeyConfigDialog(QDialog):
+    def __init__(self, current_hotkeys, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Configure Status Hotkeys")
+        self.resize(380, 260)
+        self.hotkey_editors = {}
+        self.result_hotkeys = {}
+
+        layout = QVBoxLayout(self)
+        form_layout = QFormLayout()
+
+        for status in STATUS_OPTIONS:
+            seq_edit = QKeySequenceEdit()
+            if status in current_hotkeys and current_hotkeys[status]:
+                seq_edit.setKeySequence(QKeySequence(current_hotkeys[status]))
+            self.hotkey_editors[status] = seq_edit
+            form_layout.addRow(QLabel(f"<b>{status}:</b>"), seq_edit)
+
+        layout.addLayout(form_layout)
+
+        buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
+        buttons.accepted.connect(self.accept_keys)
+        buttons.rejected.connect(self.reject)
+        layout.addWidget(buttons)
+
+    def accept_keys(self):
+        for status, editor in self.hotkey_editors.items():
+            seq_str = editor.keySequence().toString()
+            if seq_str:
+                self.result_hotkeys[status] = seq_str
+        self.accept()
 
 # -------------------------------------------------------------------
 # PAST NET SELECTION DIALOG
@@ -341,9 +381,55 @@ class NetLoggerApp(QMainWindow):
         self.resize(1050, 650)
         self.current_net_id = None
         
+        # Default hotkey mapping: Status -> KeySequence string
+        self.hotkeys = {
+            "General": "Ctrl+1",
+            "Mobile": "Ctrl+2",
+            "Portable": "Ctrl+3",
+            "Short Time": "Ctrl+4",
+            "In/Out": "Ctrl+5"
+        }
+        self.active_shortcuts = []
+
         init_databases()
         self.init_ui()
+        self.setup_menu()
+        self.register_hotkeys()
         self.start_new_net_session()
+
+    def setup_menu(self):
+        menubar = self.menuBar()
+        settings_menu = menubar.addMenu("Settings")
+
+        hotkey_action = QAction("Configure Status Hotkeys", self)
+        hotkey_action.triggered.connect(self.open_hotkey_dialog)
+        settings_menu.addAction(hotkey_action)
+
+    def register_hotkeys(self):
+        # Clear old shortcuts
+        for sc in self.active_shortcuts:
+            sc.setParent(None)
+        self.active_shortcuts.clear()
+
+        # Bind active shortcuts to update current input status
+        for status, key_seq in self.hotkeys.items():
+            if key_seq:
+                shortcut = QShortcut(QKeySequence(key_seq), self)
+                shortcut.activated.connect(lambda s=status: self.set_status_from_shortcut(s))
+                self.active_shortcuts.append(shortcut)
+
+    def set_status_from_shortcut(self, status_name):
+        index = self.status_dropdown.findText(status_name)
+        if index >= 0:
+            self.status_dropdown.setCurrentIndex(index)
+            self.status_label.setText(f"Status shortcut set to: {status_name}")
+
+    def open_hotkey_dialog(self):
+        dialog = HotkeyConfigDialog(self.hotkeys, self)
+        if dialog.exec() == QDialog.DialogCode.Accepted:
+            self.hotkeys = dialog.result_hotkeys
+            self.register_hotkeys()
+            self.status_label.setText("Hotkey configuration updated.")
 
     def init_ui(self):
         main_layout = QVBoxLayout()
@@ -383,7 +469,7 @@ class NetLoggerApp(QMainWindow):
         self.loc_input.setPlaceholderText("Location")
 
         self.status_dropdown = QComboBox()
-        self.status_dropdown.addItems(["General", "Mobile", "Portable", "Short Time", "In/Out"])
+        self.status_dropdown.addItems(STATUS_OPTIONS)
         self.status_dropdown.installEventFilter(self)
 
         form_layout.addWidget(QLabel("Call:"))
@@ -415,7 +501,6 @@ class NetLoggerApp(QMainWindow):
         self.table = QTableWidget(0, 7)
         self.table.setHorizontalHeaderLabels(["Timestamp", "Callsign", "Name", "Location", "Status", "Comments", "Action"])
         
-        # Set column resize modes: Stretch main columns, keep Action column fixed size
         header = self.table.horizontalHeader()
         header.setSectionResizeMode(0, QHeaderView.ResizeMode.Interactive)
         header.setSectionResizeMode(1, QHeaderView.ResizeMode.Interactive)
@@ -576,6 +661,10 @@ class NetLoggerApp(QMainWindow):
         self.call_input.setFocus()
         self.load_session_logs()
 
+    def on_table_status_changed(self, checkin_id, new_status):
+        update_checkin_status_by_id(checkin_id, new_status)
+        self.status_label.setText(f"Updated status for check-in #{checkin_id} to '{new_status}'")
+
     def confirm_delete_checkin(self, checkin_id, callsign):
         reply = QMessageBox.question(
             self,
@@ -607,15 +696,30 @@ class NetLoggerApp(QMainWindow):
         self.table.setRowCount(0)
         for row_idx, row_data in enumerate(rows):
             checkin_id = row_data[0]
-            display_data = row_data[1:]  # [Timestamp, Callsign, Name, Location, Status, Comments]
-            callsign = row_data[2] or "Unknown"
+            timestamp, callsign, name, location, status_val, comments = row_data[1:]
+            callsign = callsign or "Unknown"
 
             self.table.insertRow(row_idx)
-            for col_idx, value in enumerate(display_data):
-                item = QTableWidgetItem(str(value or ""))
-                self.table.setItem(row_idx, col_idx, item)
 
-            # Add Red 'X' Delete Button to the Action column (Column index 6)
+            # Columns 0-3: Text items
+            self.table.setItem(row_idx, 0, QTableWidgetItem(str(timestamp or "")))
+            self.table.setItem(row_idx, 1, QTableWidgetItem(str(callsign)))
+            self.table.setItem(row_idx, 2, QTableWidgetItem(str(name or "")))
+            self.table.setItem(row_idx, 3, QTableWidgetItem(str(location or "")))
+
+            # Column 4: Editable Status ComboBox
+            cell_combo = QComboBox()
+            cell_combo.addItems(STATUS_OPTIONS)
+            curr_idx = cell_combo.findText(status_val or "General")
+            if curr_idx >= 0:
+                cell_combo.setCurrentIndex(curr_idx)
+            cell_combo.currentTextChanged.connect(lambda text, cid=checkin_id: self.on_table_status_changed(cid, text))
+            self.table.setCellWidget(row_idx, 4, cell_combo)
+
+            # Column 5: Comments
+            self.table.setItem(row_idx, 5, QTableWidgetItem(str(comments or "")))
+
+            # Column 6: Delete Button
             delete_btn = QPushButton("✕")
             delete_btn.setToolTip("Delete this check-in")
             delete_btn.setStyleSheet("""
